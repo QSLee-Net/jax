@@ -645,7 +645,9 @@ def batched_device_put(
     sharding: Any,
     shards: Sequence[Any],
     devices: list[Device],
-    committed: bool = True,
+    committed: bool = ...,
+    force_copy: bool = ...,
+    host_buffer_semantics: Any = ...,
 ) -> ArrayImpl: ...
 def reorder_shards(
     x: ArrayImpl,
@@ -989,3 +991,5 @@ def approx_top_k_reduction_output_size(
     aggregate_to_topk: bool | None = ...,
     input_size_override: int | None = ...,
 ) -> tuple[int, int]: ...
+
+def get_internal_device_put_info() -> dict[str, int]: ...

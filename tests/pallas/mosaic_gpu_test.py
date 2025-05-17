@@ -19,6 +19,7 @@ import math
 import operator
 import os
 import re
+import sys
 import tempfile
 from typing import ClassVar
 
@@ -106,6 +107,8 @@ class PallasTest(jtu.JaxTestCase, metaclass=PallasTestMetaclass):
 
   @contextlib.contextmanager
   def capture_stdout(self):
+    if "pytest" in sys.modules:
+      self.skipTest("pytest interacts badly with GPU stdout capture")
     if mosaic_gpu_lib is None:
       raise ValueError("Running tests but missing Mosaic GPU extension")
     with jtu.capture_stdout() as stdout:
@@ -1218,8 +1221,6 @@ class PallasCallTest(PallasTest):
     np.testing.assert_array_equal(kernel(x, y), x + y)
 
   def test_while_loop(self):
-    self.skip_if_wg_semantics()
-
     @functools.partial(
         self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], jnp.int32)
     )
@@ -1242,8 +1243,6 @@ class PallasCallTest(PallasTest):
     )
 
   def test_while_loop_layout_mismatch(self):
-    self.skip_if_wg_semantics()  # while and conditional are not yet supported.
-
     @functools.partial(
         self.pallas_call, out_shape=jax.ShapeDtypeStruct([128], jnp.int32)
     )
@@ -1261,8 +1260,17 @@ class PallasCallTest(PallasTest):
 
       _ = jax.lax.while_loop(cond, body, o_ref[...])
 
-    with self.assertRaisesRegex(ValueError, "has layout .*, when it should be"):
-      kernel()
+    if self.LOWERING_SEMANTICS == plgpu.LoweringSemantics.Warpgroup:
+      with self.assertRaisesRegex(
+          NotImplementedError,
+          "Cannot convert from WGStridedFragLayout.* to TiledLayout",
+      ):
+        kernel()
+    else:
+      with self.assertRaisesRegex(
+          ValueError, "has layout .*, when it should be"
+      ):
+        kernel()
 
   def test_cond(self):
     @functools.partial(
@@ -1666,6 +1674,45 @@ class PallasCallTest(PallasTest):
     test_as_i8 = jax.lax.convert_element_type(kernel(x), new_dtype=jnp.int8)
     np.testing.assert_array_equal(test_as_i8[:256], unpack_i4_as_i8(x))
 
+  def test_smem_aliasing_works_for_quantization(self):
+    self.skip_if_wg_semantics()
+    shape = (64, 256)
+    large_ty, small_ty = jnp.bfloat16, jnp.uint4
+    large_swizzle = plgpu.SwizzleTransform(64 * jnp.finfo(large_ty).bits // 8)
+    small_swizzle = plgpu.SwizzleTransform(64 * jnp.iinfo(small_ty).bits // 8)
+    tiling = plgpu.TilingTransform((8, 64))
+
+    def kernel(x_gmem, o_gmem):
+      return pl.run_scoped(
+          functools.partial(scoped_kernel, x_gmem, o_gmem),
+          plgpu.RefUnion(
+              plgpu.SMEM(shape, large_ty, transforms=(tiling, large_swizzle)),
+              plgpu.SMEM(shape, small_ty, transforms=(tiling, small_swizzle))
+          ),
+          plgpu.Barrier(1, num_barriers=1),
+      )
+
+    def scoped_kernel(x_gmem, o_gmem, aliased_ref, barrier):
+      ref_large_ty, ref_small_ty = aliased_ref
+      plgpu.copy_gmem_to_smem(x_gmem, ref_small_ty, barrier=barrier)
+      plgpu.barrier_wait(barrier)
+      ref_large_ty[...] = ref_small_ty[...].astype(ref_large_ty.dtype) * 3
+      plgpu.commit_smem()
+      plgpu.copy_smem_to_gmem(ref_large_ty, o_gmem)
+      plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+    kernel_fn = self.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
+        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
+        out_shape=jax.ShapeDtypeStruct(shape, large_ty),
+        grid=(1, 1),
+    )
+    key = jax.random.key(42)
+    x = jax.random.randint(key, shape, 0, 4).astype(small_ty)
+    expected = x * 3
+    np.testing.assert_array_equal(kernel_fn(x), expected)
+
   def test_assigning_to_ref_union_raises(self):
     @functools.partial(
         self.pallas_call,
@@ -1722,10 +1769,6 @@ class PallasCallSm90ATest(PallasSm90ATest):
 
   @parameterized.parameters(False, True)
   def test_fori_loop_accumulator(self, force_while):
-    if force_while:
-      # Layout inference and lowering for 'while' are not yet implemented for
-      # warpgroup semantics.
-      self.skip_if_wg_semantics()
     if self.LOWERING_SEMANTICS == plgpu.LoweringSemantics.Lane:
       transforms = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
     else:
@@ -3320,20 +3363,6 @@ class ExamplesSm90ATest(PallasSm90ATest):
       )(l_ref, r_ref, o_ref)
 
     np.testing.assert_allclose(kernel(x, x), x @ x)
-
-  def test_debug_bug(self):
-    dtype = jnp.float16
-    @functools.partial(
-        self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct([256], dtype),
-    )
-    def kernel(o_ref):
-      kv_step = jnp.asarray(0)
-      @pl.when(kv_step < -2)
-      def dp():
-        pl.debug_print("foo")
-      o_ref[...] = jnp.zeros_like(o_ref)
-    kernel()
 
   # TODO(apaszke): Clusters and multicast
 

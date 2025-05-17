@@ -21,11 +21,17 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     given its name.
 
 * Changes
+  * Additional checking for the versions of CUDA package dependencies was
+    reenabled, having been accidentally disabled in a previous release.
   * JAX nightly packages are now published to artifact registry. To install
     these packages, see the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html#jax-nightly-installation).
   * `jax.sharding.PartitionSpec` no longer inherits from a tuple.
   * `jax.ShapeDtypeStruct` is immutable now. Please use `.update` method to
     update your `ShapeDtypeStruct` instead of doing in-place updates.
+
+* Deprecations
+  * `jax.custom_derivatives.custom_jvp_call_jaxpr_p` is deprecated, and will be
+    removed in JAX v0.7.0.
 
 ## JAX 0.6.0 (April 16, 2025)
 

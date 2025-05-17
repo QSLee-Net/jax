@@ -64,9 +64,23 @@ string_flag(
 )
 
 config_setting(
-    name = "enable_jaxlib_build",
+    name = "config_build_jaxlib_true",
     flag_values = {
         ":build_jaxlib": "true",
+    },
+)
+
+config_setting(
+    name = "config_build_jaxlib_false",
+    flag_values = {
+        ":build_jaxlib": "false",
+    },
+)
+
+config_setting(
+    name = "config_build_jaxlib_wheel",
+    flag_values = {
+        ":build_jaxlib": "wheel",
     },
 )
 
@@ -87,17 +101,22 @@ string_flag(
 )
 
 config_setting(
-    name = "disable_jaxlib_and_jax_build",
+    name = "config_build_jax_true",
     flag_values = {
-        ":build_jaxlib": "false",
+        ":build_jax": "true",
+    },
+)
+
+config_setting(
+    name = "config_build_jax_false",
+    flag_values = {
         ":build_jax": "false",
     },
 )
 
 config_setting(
-    name = "enable_jaxlib_and_jax_py_import",
+    name = "config_build_jax_wheel",
     flag_values = {
-        ":build_jaxlib": "wheel",
         ":build_jax": "wheel",
     },
 )
@@ -212,7 +231,6 @@ py_library(
             ":jax",
         ],
         if_not_building = [],
-        if_not_building_for_cpu = [],
     ) + py_deps("numpy"),
 )
 
@@ -229,7 +247,6 @@ py_library(
             "//jax/_src/lib",
         ],
         if_not_building = [],
-        if_not_building_for_cpu = [],
     ) + py_deps("numpy"),
 )
 
@@ -243,7 +260,6 @@ py_library(
             ":test_util",
         ],
         if_not_building = [],
-        if_not_building_for_cpu = [],
     ),
 )
 
@@ -259,7 +275,6 @@ py_library(
             ":test_util",
         ],
         if_not_building = [],
-        if_not_building_for_cpu = [],
     ) + py_deps("numpy"),
 )
 
@@ -872,7 +887,6 @@ pytype_strict_library(
 py_library_providing_imports_info(
     name = "mosaic_gpu",
     srcs = glob(["experimental/mosaic/gpu/*.py"]),
-    data = py_deps("libnvshmem_device"),
     visibility = [
         ":mosaic_gpu_users",
     ],
@@ -1170,6 +1184,7 @@ pytype_strict_library(
         ":abstract_arrays",
         ":config",
         ":core",
+        ":deprecations",
         ":dtypes",
         ":sharding_impls",
         ":source_info_util",

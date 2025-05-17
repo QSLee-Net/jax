@@ -45,6 +45,7 @@ limitations under the License.
 #include "nanobind/stl/string.h"  // IWYU pragma: keep
 #include "nanobind/stl/string_view.h"  // IWYU pragma: keep
 #include "nanobind/stl/unique_ptr.h"  // IWYU pragma: keep
+#include "nanobind/stl/unordered_map.h"  // IWYU pragma: keep
 #include "nanobind/stl/variant.h"  // IWYU pragma: keep
 #include "nanobind/stl/vector.h"  // IWYU pragma: keep
 #include "jaxlib/ffi.h"
@@ -489,7 +490,10 @@ NB_MODULE(_jax, m) {
               &CompiledMemoryStats::host_temp_size_in_bytes)
       .def_prop_ro("serialized_buffer_assignment_proto",
                    [](const CompiledMemoryStats& cms) -> nb::bytes {
-#if JAX_IFRT_VERSION_NUMBER >= 7
+#if JAX_IFRT_VERSION_NUMBER >= 9
+                     const std::string& s = cms.serialized_buffer_assignment;
+                     return nb::bytes(s.data(), s.size());
+#elif JAX_IFRT_VERSION_NUMBER >= 7
                      if (cms.buffer_assignment.has_value()) {
                        std::string s =
                            cms.buffer_assignment->SerializeAsString();
@@ -974,6 +978,9 @@ NB_MODULE(_jax, m) {
         nb::arg("input_size"), nb::arg("rank"), nb::arg("top_k"),
         nb::arg("recall_target"), nb::arg("aggregate_to_topk") = true,
         nb::arg("input_size_override") = -1);
+
+  m.def("get_internal_device_put_info",
+        []() { return DevicePutInfo::GetInfo(); });
 
 }  // NOLINT(readability/fn_size)
 

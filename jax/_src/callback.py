@@ -40,7 +40,7 @@ from jax._src.lax.control_flow.loops import map as lax_map
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
-from jax._src.sharding_impls import SdyArraySharding, SdyArrayShardingList, SingleDeviceSharding
+from jax._src.sharding_impls import SdyArray, SdyArrayList, SdyDim, SingleDeviceSharding
 from jax._src.typing import DeprecatedArg
 import numpy as np
 
@@ -154,13 +154,15 @@ def _callback_op_sharding(
           " computations"
       )
     if config.use_shardy_partitioner.value:
-      assert len(avals_out) == 1
-      op_sharding = sharding_impls.SdyArrayShardingList([
-          sharding_impls.SdyArraySharding(
+      ndim = 0
+      if avals_out and isinstance(avals_out[0], core.ShapedArray):
+        ndim = avals_out[0].ndim
+      op_sharding = SdyArrayList([
+          SdyArray(
               mesh_shape=(),
-              dimension_shardings=[
-                  sharding_impls.SdyDimSharding(axes=[], is_open=False)
-              ] * avals_out[0].ndim,
+              dim_shardings=[
+                  SdyDim(axes=[], is_open=False)
+              ] * ndim,
               logical_device_ids=())])
     else:
       op_sharding = xc.OpSharding()  # type: ignore[assignment]
@@ -197,10 +199,10 @@ def _callback_op_sharding(
       # number of result ops. If there are no result ops, we need 1 shardy
       # annotation.
       num_sdy_shardings = max(1, len(avals_out))
-      op_sharding = sharding_impls.SdyArrayShardingList(num_sdy_shardings * [
-          sharding_impls.SdyArraySharding(
+      op_sharding = SdyArrayList(num_sdy_shardings * [
+          SdyArray(
               mesh_shape=(),
-              dimension_shardings=[],
+              dim_shardings=[],
               logical_device_ids=(device_index,))])
     else:
       op_sharding = xc.OpSharding()  # type: ignore[assignment]
@@ -590,7 +592,7 @@ def send_to_host(
     operand: Any,
     name: str,
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> ir.Value:
   channel_handle = hlo.ChannelHandle.get(channel, mlir.SEND_TO_HOST_TYPE)
   send_op = hlo.SendOp([operand], token, channel_handle,
@@ -606,11 +608,11 @@ def send_to_host(
       # we need to create an equivalent sharding with no dimensions. If there
       # are multiple shardings, just grab the first one since all these
       # shardings should be the same.
-      assert isinstance(sharding, SdyArrayShardingList)
+      assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
-      sharding = SdyArrayShardingList([
-          SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[],
+      sharding = SdyArrayList([
+          SdyArray(
+              mesh_shape=(), dim_shardings=[],
               logical_device_ids=sharding.shardings[0].logical_device_ids)])
     mlir.set_sharding(send_op, sharding)
   return send_op.result
@@ -622,7 +624,7 @@ def receive_from_host(
     out_aval: core.ShapedArray,
     name: str,
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[ir.Value, ir.Value]:
   channel_handle = hlo.ChannelHandle.get(channel, mlir.RECV_FROM_HOST_TYPE)
   recv_op = hlo.RecvOp([mlir.aval_to_ir_type(out_aval),
@@ -634,7 +636,7 @@ def receive_from_host(
           _xla_host_transfer_rendezvous=ir.StringAttr.get(str(name))))
   if sharding is not None:
     if config.use_shardy_partitioner.value:
-      assert isinstance(sharding, SdyArrayShardingList)
+      assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
        # `RecvOp`'s last argument is a `TokenType`. Since Shardy requires the
       # number of shardings to match the number of results, but JAX only sees
@@ -642,10 +644,10 @@ def receive_from_host(
       # Note that even if a function returns N results, we will end up with N
       # `RecvOp`s, so we only need to get the first sharding. All shardings are
       # the same anyways, operating on the same single device ID.
-      sharding = SdyArrayShardingList([
+      sharding = SdyArrayList([
           sharding.shardings[0],
-          SdyArraySharding(
-              mesh_shape=(), dimension_shardings=[],
+          SdyArray(
+              mesh_shape=(), dim_shardings=[],
               logical_device_ids=sharding.shardings[0].logical_device_ids)])
     mlir.set_sharding(recv_op, sharding)
   # Token should be at the end of the results
@@ -683,7 +685,7 @@ def _emit_tpu_python_callback(
     result_avals: Sequence[core.ShapedArray],
     result_shapes: Sequence[xc.Shape],
     *,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[Sequence[ir.Value], Any]:
   token = token or hlo.create_token()
   _wrapped_callback = callback
@@ -738,7 +740,7 @@ def emit_python_callback(
     *,
     has_side_effect: bool,
     partitioned: bool = False,
-    sharding: SdyArrayShardingList | xc.OpSharding | None = None,
+    sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[Sequence[mlir.IrValues], Any, Any]:
   """Emits MLIR that calls back to a provided Python function.
 
@@ -836,14 +838,17 @@ def emit_python_callback(
         config.use_shardy_partitioner.value
         and sharding is not None
         and len(ctx.avals_out) > 0
-        and isinstance(sharding, sharding_impls.SdyArrayShardingList)
+        and isinstance(sharding, SdyArrayList)
     ):
       # Add a sharding annotation for the token if we have at least one
       # output. Otherwise, the single shardy annotation required of all ops
       # (even those without any results) can annotate the token.
-      sharding = sharding_impls.SdyArrayShardingList(
-          [*sharding.shardings, sharding.shardings[-1]]
-      )
+      sharding = SdyArrayList([
+          SdyArray(
+              mesh_shape=(),
+              dim_shardings=[],
+              logical_device_ids=()),
+          *sharding.shardings])
     ctx = dataclasses.replace(
         ctx,
         avals_in=[core.abstract_token, *ctx.avals_in],

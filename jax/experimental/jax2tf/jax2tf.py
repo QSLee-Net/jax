@@ -3062,8 +3062,11 @@ tf_impl_with_avals[lax.scatter_sub_p] = _scatter
 
 
 def _cond(
-    index: TfVal, *operands: TfVal, branches: Sequence[core.ClosedJaxpr]
+    index: TfVal, *operands: TfVal, branches: Sequence[core.ClosedJaxpr],
+    **params
 ) -> Sequence[TfVal]:
+  if params:
+    raise NotImplementedError("jax2tf conversion for platform_dependent")
   # tf.cond needs lambdas with no arguments.
   branches_tf = [
       partial(_interpret_jaxpr, jaxpr, *operands,
@@ -3458,14 +3461,14 @@ def _custom_jvp_call(*args: TfVal, call_jaxpr: core.ClosedJaxpr,
 tf_impl[custom_derivatives.custom_jvp_call_p] = _custom_jvp_call
 
 
-def _custom_vjp_call_jaxpr(*args: TfVal, fun_jaxpr: core.ClosedJaxpr,
-                           **_) -> Sequence[TfVal]:
+def _custom_vjp_call(*args: TfVal, call_jaxpr: core.ClosedJaxpr,
+                     **_) -> Sequence[TfVal]:
   # TODO(necula): ensure that there is no AD transformation in scope
-  return _interpret_jaxpr(fun_jaxpr, *args, extra_name_stack="custom_vjp",
+  return _interpret_jaxpr(call_jaxpr, *args, extra_name_stack="custom_vjp",
                           fresh_constant_cache=False)
 
 
-tf_impl[custom_derivatives.custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr
+tf_impl[custom_derivatives.custom_vjp_call_p] = _custom_vjp_call
 
 
 def _custom_lin(*args: TfVal, **_) -> Sequence[TfVal]:

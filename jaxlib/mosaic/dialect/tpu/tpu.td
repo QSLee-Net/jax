@@ -441,6 +441,7 @@ def TPU_RelayoutOp : TPU_Op<"relayout", [SameOperandsAndResultType]> {
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$output);
   let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
+  let hasVerifier = 1;
 }
 
 def TPU_PackMaskOp : TPU_Op<"pack_vmsk", [Pure, SameTypeOperands]> {
@@ -1005,6 +1006,8 @@ def CanonicalizeMosaicPass : Pass<"tpu-canonicalize-mosaic", "::mlir::func::Func
   let options = [
     Option<"hardware_generation", "hardware-generation", "int", /*default=*/"-1", "">,
     Option<"compatibility_mode", "compatibility-mode", "bool", /*default=*/"1", "">,
+    Option<"lane_count", "lane-count", "int", /*default=*/"128", "">,
+    Option<"sublane_count", "sublane-count", "int", /*default=*/"8", "">,
   ];
 }
 

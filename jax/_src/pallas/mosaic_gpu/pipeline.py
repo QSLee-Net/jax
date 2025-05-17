@@ -326,7 +326,8 @@ def emit_pipeline(
             predicate=lax.bitwise_or(slices_changed, is_last_step),
         )
 
-      gpu_primitives.commit_smem_to_gmem_group()
+      if copies_out_in_loop:
+        gpu_primitives.commit_smem_to_gmem_group()
 
       fetch_step = step + (max_concurrent_steps - delay_release)
       fetch_slot = lax.rem(fetch_step, max_concurrent_steps)
@@ -367,6 +368,7 @@ def emit_pipeline(
     # loop. This is the only place where we store them.
     if not copies_out_in_loop:
       gpu_primitives.commit_smem()
+
     last_slot = lax.rem(num_steps - 1, max_concurrent_steps)
     for bref in out_brefs:
       if bref.is_index_invariant:
@@ -663,13 +665,11 @@ def emit_pipeline_warp_specialized(
           if last_indices is not None:
             raise ValueError(
               "Cannot call pipeline more than once in `compute_context`")
-          print("[DEBUG] user_init_carry: ", user_init_carry)
           init_loop_carry = (init_indices, last_store_slices, user_init_carry)
           last_indices, _, final_body_carry = lax.fori_loop(0,
                         num_steps,
                         compute_loop_body,
                         init_loop_carry)
-          print("[DEBUG] final_body_carry: ", final_body_carry)
           return final_body_carry
         compute_context(pipeline_callback)
         if last_indices is None:

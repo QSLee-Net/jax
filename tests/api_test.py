@@ -54,12 +54,14 @@ from jax._src import test_util as jtu
 from jax._src import xla_bridge
 from jax._src import debugging
 from jax._src import pjit as pjit_lib
+from jax._src import sharding_impls
 from jax._src.ad_checkpoint import saved_residuals
 from jax._src.interpreters import ad as ad_internal
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.compilation_cache import is_persistent_cache_enabled
 from jax._src.lib import _jax
+from jax._src.lib import jaxlib_extension_version
 import jax._src.util as jax_util
 from jax.ad_checkpoint import checkpoint_name, checkpoint as new_checkpoint
 from jax.errors import (UnexpectedTracerError, TracerIntegerConversionError,
@@ -1971,6 +1973,92 @@ class APITest(jtu.JaxTestCase):
         r"NamedSharding\(.*\)\) for value tree PyTreeDef\(\(\*, \*, \*\)\)."
     ):
       jax.device_put((x, y, z), device=(s1, s2))
+
+  def test_internal_device_put_with_device(self):
+    if jaxlib_extension_version < 341:
+      raise unittest.SkipTest(
+          "Test requires jaxlib extension version >= 341 for tracking low-level"
+          " DevicePut calls")
+
+    # Hitting the cache for a single-device jitted execution while using a numpy
+    # array calls internal `DevicePutWithDevice`.
+    f = jax.jit(lambda x: x + 1)
+    f(np.arange(8))
+
+    with jtu.count_internal_device_puts() as counts:
+      f(np.arange(8))
+    self.assertEqual(counts(), {"device_put_with_device": 1})
+
+  def test_internal_device_put_fully_replicated(self):
+    if jaxlib_extension_version < 341:
+      raise unittest.SkipTest(
+          "Test requires jaxlib extension version >= 341 for tracking low-level"
+          " DevicePut calls")
+    if jax.device_count() < 2:
+      raise unittest.SkipTest("Test requires >= 2 devices")
+
+    # Creating an array from a numpy array with a fully-replicated sharding
+    # calls internal `DevicePutWithSharding`, taking the fully-replicated sub
+    # case.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), "x")
+    sharding = jax.NamedSharding(mesh, P())
+
+    with jtu.count_internal_device_puts() as counts:
+      jax.device_put(np.arange(8), sharding)
+    self.assertEqual(
+        counts(),
+        {"device_put_with_sharding": 1, "device_put_fully_replicated": 1},
+    )
+
+  def test_internal_device_put_batched(self):
+    if jaxlib_extension_version < 341:
+      raise unittest.SkipTest(
+          "Test requires jaxlib extension version >= 341 for tracking low-level"
+          " DevicePut calls")
+    if jax.device_count() < 2:
+      raise unittest.SkipTest("Test requires >= 2 devices")
+
+    # Creating an array from a numpy array with a non-fully-replicated sharding
+    # calls internal `DevicePutWithSharding`, performing batched creation of a
+    # multi-shard array.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), "x")
+    sharding = jax.NamedSharding(mesh, P("x"))
+
+    with jtu.count_internal_device_puts() as counts:
+      jax.device_put(np.arange(8), sharding)
+    self.assertEqual(
+        counts(), {"device_put_with_sharding": 1, "device_put_batched": 1}
+    )
+
+  def test_internal_device_put_assembled(self):
+    if jaxlib_extension_version < 341:
+      raise unittest.SkipTest(
+          "Test requires jaxlib extension version >= 341 for tracking low-level"
+          " DevicePut calls")
+    if jax.device_count() < 2:
+      raise unittest.SkipTest("Test requires >= 2 devices")
+
+    # Creating an array from per-device JAX arrays calls internal
+    # `DevicePutWithSharding`, performing per-shard array adoption followed by
+    # assembly.
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), "x")
+    sharding = jax.NamedSharding(mesh, P("x"))
+
+    arr = np.arange(8)
+    per_device_arrs = {
+        # Use uncommitted arrays that are not aligned with the destination
+        # sharding so that we trigger `BatchedDevicePut`.
+        sharding_impls.hashed_index(index): jnp.array(arr[index])
+        for _, index in sharding.devices_indices_map(arr.shape).items()
+    }
+    data_callback = lambda index: per_device_arrs[
+        sharding_impls.hashed_index(index)
+    ]
+    with jtu.count_internal_device_puts() as counts:
+      jax.make_array_from_callback(arr.shape, sharding, data_callback)
+    self.assertEqual(
+        counts(), {"device_put_with_sharding": 1, "device_put_assembled": 1}
+    )
 
   def test_device_put_custom_type_not_accepting_none_leaves(self):
 
@@ -3951,6 +4039,9 @@ class APITest(jtu.JaxTestCase):
   def test_dunder_jax_array(self):
     # https://github.com/jax-ml/jax/pull/4725
 
+    @partial(jax.tree_util.register_dataclass,
+             data_fields=['jax_val'],
+             meta_fields=[])
     class AlexArray:
       def __init__(self, jax_val):
         self.jax_val = jax_val
@@ -3960,10 +4051,16 @@ class APITest(jtu.JaxTestCase):
       shape = property(lambda self: self.jax_val.shape)
 
     x = AlexArray(jnp.array([1., 2., 3.]))
+
+    y = jax.jit(lambda x: x)(x)
+    self.assertIsInstance(x, AlexArray)
+    self.assertArraysEqual(jnp.asarray(x), jnp.asarray(y))
+
     y = jnp.sin(x)
     self.assertAllClose(y, jnp.sin(jnp.array([1., 2., 3.])))
     y = api.grad(api.jit(lambda x: jnp.sin(x).sum()))(x)
-    self.assertAllClose(y, jnp.cos(jnp.array([1., 2., 3.])))
+    self.assertIsInstance(y, AlexArray)
+    self.assertAllClose(jnp.asarray(y), jnp.cos(jnp.array([1., 2., 3.])))
 
     x = AlexArray(jnp.array([[1., 2., 3.]]))
     y = api.pmap(jnp.sin)(x)
@@ -3980,6 +4077,19 @@ class APITest(jtu.JaxTestCase):
 
     a2 = jnp.array(((x, x), [x, x]))
     self.assertAllClose(np.array(((1, 1), (1, 1))), a2)
+
+  def test_dunder_jax_array_warnings(self):
+    class AlexArray:
+      def __init__(self, jax_val):
+        self.jax_val = jax_val
+      def __jax_array__(self):
+        return self.jax_val
+
+    f = jax.jit(lambda x: x)
+    a = AlexArray(jnp.arange(4))
+    msg = r"Triggering of __jax_array__\(\) during abstractification is deprecated."
+    with self.assertDeprecationWarnsOrRaises('jax-abstract-dunder-array', msg):
+      f(a)
 
   @jtu.thread_unsafe_test()  # count_jit_tracing_cache_miss() isn't thread-safe
   def test_eval_shape_weak_type(self):
