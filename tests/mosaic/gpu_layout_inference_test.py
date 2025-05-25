@@ -19,7 +19,6 @@
 from absl.testing import parameterized
 import jax
 from jax._src import config
-from jax._src import lib as jaxlib
 from jax._src import test_util as jtu
 from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib.mlir import ir
@@ -245,12 +244,7 @@ class LayoutInferenceTest(parameterized.TestCase):
   def test_infer_broadcast_in_dim_layout(
       self, broadcast_dim, in_cast, out_cast, in_layout, out_layout
   ):
-    # TODO(dasenov): Remove this after the minimal jaxlib version is 0.6.1.
-    if jaxlib.version < (0, 6, 1):
-      self.skipTest("Test requires jaxlib version >= 0.6.1")
-
     bcast = None
-
     in_shape = (64,)
     out_shape = (64, 64)
 
@@ -428,6 +422,59 @@ class LayoutInferenceTest(parameterized.TestCase):
     self.assertSequenceEqual(yield_op.attributes["out_layouts"], [])
     self.assertSequenceEqual(for_op.attributes["in_layouts"], [wgmma_layout])
     self.assertSequenceEqual(for_op.attributes["out_layouts"], [wgmma_layout])
+
+  @parameterized.parameters(
+      ((), None, (), None),
+      ((64, 32), mgpu.WGMMA_LAYOUT, (), None),
+      ((), None, (64, 32), mgpu.WGMMA_LAYOUT),
+      ((64,), mgpu.WGMMA_ROW_LAYOUT, (64, 32), mgpu.WGMMA_LAYOUT),
+  )
+  def test_infer_while_op_layouts(
+      self, init_shape, init_layout, result_shape, result_layout
+  ):
+    if init_shape:
+      in_type = ir.VectorType.get(init_shape, ir.F32Type.get())
+    else:
+      in_type = ir.F32Type.get()
+
+    if result_shape:
+      out_type = ir.VectorType.get(result_shape, ir.F32Type.get())
+    else:
+      out_type = ir.F32Type.get()
+
+    while_op = condition_op = yield_op = None
+
+    def body(condition, init, result):
+      nonlocal while_op, condition_op, yield_op
+      while_op = scf.WhileOp([out_type], [init])
+      before_block = while_op.before.blocks.append(init.type)
+      with ir.InsertionPoint(before_block):
+        condition_op = scf.ConditionOp(condition, [result])
+
+      after_block = while_op.after.blocks.append(out_type)
+      with ir.InsertionPoint(after_block):
+        yield_op = scf.YieldOp([init])
+
+    with ir.InsertionPoint(self.module.body):
+      i1 = ir.IntegerType.get_signless(1)
+      func.FuncOp.from_py_func(i1, in_type, out_type)(body)
+
+    [f] = self.module.body.operations
+    f_layouts = []
+    if init_layout:
+      f_layouts.append(layouts.to_layout_attr(init_layout))
+    if result_layout:
+      f_layouts.append(layouts.to_layout_attr(result_layout))
+    if f_layouts:
+      f.attributes["in_layouts"] = ir.ArrayAttr.get(f_layouts)
+
+    mgpu.infer_layout(self.module)
+
+    if init_layout or result_layout:
+      init_layouts = [layouts.to_layout_attr(init_layout)] if init_layout else []
+      result_layouts = [layouts.to_layout_attr(result_layout)] if result_layout else []
+      self.assertSequenceEqual(while_op.attributes["in_layouts"], init_layouts)
+      self.assertSequenceEqual(while_op.attributes["out_layouts"], result_layouts)
 
   def test_infer_layout_has_no_layout_for_non_vector_types(self):
     shape = (32, 4)

@@ -36,7 +36,7 @@ from jax.sharding import PartitionSpec as P
 from jax._src import config
 from jax._src import core
 from jax._src import prng
-from jax._src.shard_map import shard_map, smap, Infer
+from jax._src.shard_map import shard_map, smap
 from jax._src import test_util as jtu
 from jax._src.lib.mlir.dialects import sdy
 from jax._src.util import safe_zip, safe_map, partition_list, merge_lists
@@ -289,6 +289,39 @@ class ShardMapTest(jtu.JaxTestCase):
 
     c = fwd(a)
     assert (c == jnp.reshape(a.T, (1, 64))).all()
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='_partial_replicated', replicate_on_axes='x',
+      ),
+      dict(
+          testcase_name='_fully_replicated',
+          replicate_on_axes=('x', 'y'),
+      ),
+  )
+  @jtu.run_on_devices("gpu")
+  def test_pbroadcast(self, replicate_on_axes):
+    mesh = jtu.create_mesh((4, 2), ('x', 'y'))
+    sharded_axes = set(mesh.axis_names) - set(replicate_on_axes)
+    sharded_axes = None if not sharded_axes else list(sharded_axes)
+    in_out_sharding = jax.sharding.NamedSharding(mesh, P(sharded_axes, None))
+    a = jax.device_put(jnp.arange(16).reshape((4, 4)), in_out_sharding)
+
+    @jax.jit
+    @partial(
+        shard_map,
+        mesh=mesh,
+        in_specs=(in_out_sharding.spec,),
+        out_specs=in_out_sharding.spec,
+        check_vma=False,
+    )
+    def fwd(x):
+      axis_index = lax.axis_index(replicate_on_axes)
+      x = jnp.where(axis_index == 0, x + 1, x)
+      return lax.pbroadcast(x, replicate_on_axes, source=0)
+
+    c = fwd(a)  # Don't crash
+    self.assertAllClose(c, a + 1)
 
   def test_all_to_all_with_axis_index_groups(self):
     mesh = jtu.create_mesh((4,), ('x',))
@@ -588,6 +621,32 @@ class ShardMapTest(jtu.JaxTestCase):
     x = f()
     self.assertAllClose(x, jnp.arange(4), check_dtypes=False)
 
+  def test_optimize_remat(self):
+    mesh = jtu.create_mesh((4,), 'x')
+
+    @jax.custom_vjp
+    def f(x):
+      return jnp.tan(x)
+
+    def f_fwd(x):
+      return jax.lax.psum(x, 'x'), (x,)
+
+    def f_bwd(res, g):
+      x, = res
+      cos_x = jnp.cos(x)
+      return (cos_x * g,)
+
+    f.defvjp(f_fwd, f_bwd, optimize_remat=True)
+
+    @jax.jit
+    @jax.shard_map(mesh=mesh, in_specs=P(), out_specs=P())
+    def temp(x):
+      out = jax.remat(f)(x)
+      out = out ** 2
+      return out
+
+    jax.grad(lambda x: temp(x).sum())(jnp.arange(4.))
+
   def test_remat_basic(self):
     # this tests remat-of-shmap
     mesh = Mesh(np.array(jax.devices()[:4]), ('x',))
@@ -703,10 +762,50 @@ class ShardMapTest(jtu.JaxTestCase):
     x = jnp.arange(4 * 4).reshape(4, 4)
     jaxpr = jax.make_jaxpr(jax.vmap(f, spmd_axis_name='y'))(x).jaxpr
     e, = jaxpr.eqns
-    self.assertIn('in_names', e.params)
-    self.assertEqual(e.params['in_names'], ({0: ('y',), 1: ('x',)},))
-    self.assertIn('out_names', e.params)
-    self.assertEqual(e.params['out_names'], ({0: ('y',), 1: ('x',)},))
+    self.assertIn('in_specs', e.params)
+    self.assertEqual(e.params['in_specs'], (P('y', 'x'),))
+    self.assertIn('out_specs', e.params)
+    self.assertEqual(e.params['out_specs'], (P('y', 'x'),))
+
+  def test_vmap_explicit_mesh_axis(self):
+    mesh = jtu.create_mesh(
+        (1, 2, 2), ('z', 'x', 'y'), axis_types=(AxisType.Explicit,) * 3)
+
+    @shard_map(mesh=mesh, in_specs=P('y'), out_specs=P('y'))
+    def f(x):
+      return x
+
+    x = jnp.arange(4 * 4).reshape(4, 4)
+    s = NamedSharding(mesh, P(('z', 'x'), 'y'))
+    x = jax.device_put(x, s)
+
+    f = jax.jit(jax.vmap(f))
+    out = f(x)
+    self.assertEqual(out.sharding, s)
+
+  def test_vmap_explicit_mesh_axis_error(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'),
+                           axis_types=(AxisType.Explicit,) * 2)
+
+    @shard_map(mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+    def f(x):
+      return x
+
+    x = jnp.arange(4 * 4).reshape(4, 4)
+    s = NamedSharding(mesh, P('x', 'y'))
+    x = jax.device_put(x, s)
+
+    f = jax.jit(jax.vmap(f))
+    with self.assertRaisesRegex(
+        ValueError, "vmapped away explicit mesh axis cannot appear"):
+      f(x)
+
+    f = jax.jit(jax.vmap(f, spmd_axis_name='y'))
+    with self.assertRaisesRegex(
+        ValueError,
+        'Only one of spmd_axis_name or arrays sharded on `Explicit` mesh axis'
+        ' type is allowed'):
+      f(x)
 
   def test_vmap_of_grad_spmd_axis_name(self):
     mesh = jtu.create_mesh((2, 2), ('x', 'y'))
@@ -738,10 +837,10 @@ class ShardMapTest(jtu.JaxTestCase):
     x = jnp.arange(4 * 4).reshape(4, 4)
     jaxpr = jax.make_jaxpr(jax.vmap(f, spmd_axis_name=('x', 'y')))(x).jaxpr
     e, = jaxpr.eqns
-    self.assertIn('in_names', e.params)
-    self.assertEqual(e.params['in_names'], ({0: ('x', 'y',)},))
-    self.assertIn('out_names', e.params)
-    self.assertEqual(e.params['out_names'], ({0: ('x', 'y',)},))
+    self.assertIn('in_specs', e.params)
+    self.assertEqual(e.params['in_specs'][0], P(('x', 'y')))
+    self.assertIn('out_specs', e.params)
+    self.assertEqual(e.params['out_specs'][0], P(('x', 'y')))
 
   def test_nested_vmap_with_capture_spmd_axis_name(self):
     self.skipTest('https://github.com/jax-ml/jax/issues/23476')
@@ -869,8 +968,6 @@ class ShardMapTest(jtu.JaxTestCase):
   @jtu.run_on_devices('cpu', 'gpu', 'tpu')
   @jtu.thread_unsafe_test()
   def test_debug_print_jit(self, jit):
-    if config.use_shardy_partitioner.value:
-      self.skipTest('TODO(b/384938613): Failing under shardy')
     mesh = Mesh(jax.devices(), ('i',))
 
     @partial(shard_map, mesh=mesh, in_specs=P('i'), out_specs=P('i'))
@@ -891,6 +988,39 @@ class ShardMapTest(jtu.JaxTestCase):
       jax.effects_barrier()
     for i in range(len(jax.devices())):
       self.assertIn(f'instance {i} has value', output())
+
+  def test_psum_transpose_non_zero_cts(self):
+    mesh = jtu.create_mesh((8,), 'x')
+    @shard_map(mesh=mesh, in_specs=P('x'), out_specs=(P('x'), P()))
+    def f1(x_block):
+      return x_block, jax.lax.psum(x_block, axis_name='x')
+
+    x1 = jnp.arange(16.)
+    f1(x1)  # doesn't crash
+
+    def f2(x_block):
+      y, _ = f1(x_block)
+      return y.sum()
+
+    jax.jit(jax.grad(f2))(x1)  # doesn't crash
+    jax.grad(f2)(x1)  # doesn't crash
+
+  @jtu.run_on_devices('cpu', 'gpu', 'tpu')
+  @jtu.thread_unsafe_test()
+  def test_debug_print_jit_partial_auto(self):
+    mesh = jtu.create_mesh((2,2), ('x', 'y'))
+
+    @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'),
+             axis_names=frozenset({'x'}))
+    def f(x):
+      idx = jax.lax.axis_index('x')
+      jax.debug.print("instance {i} has value x={x}", i=idx, x=x)
+      y = jnp.cos(x)
+      return y
+
+    f = jax.jit(f)
+    x = jnp.arange(2 * len(jax.devices()))
+    f(x)  # don't crash!
 
   def test_debug_print_eager(self):
     mesh = Mesh(jax.devices(), ('i',))
@@ -971,7 +1101,7 @@ class ShardMapTest(jtu.JaxTestCase):
 
     def f(x): return x
 
-    with self.assertRaisesRegex(TypeError, "but it was None"):
+    with self.assertRaisesRegex(TypeError, "but it was `None`"):
       shard_map(f, mesh=mesh, in_specs=None, out_specs=P())(3.)
 
     # TODO(mattjj): enable this test once we fix the tree_map(f, None, 3.0) bug
@@ -3182,7 +3312,7 @@ class ShardMapTest(jtu.JaxTestCase):
 
     @jax.jit
     def f(x):
-      return smap(h, in_axes=Infer, out_axes=0, axis_name='x')(x)
+      return smap(h, out_axes=0, axis_name='x')(x)
 
     out = f(arr)
     self.assertArraysEqual(out, np_inp * np_inp)
@@ -3214,6 +3344,80 @@ class ShardMapTest(jtu.JaxTestCase):
 
     out = g(np.arange(4), np.arange(8))
     self.assertEqual(out.sharding, NamedSharding(mesh, P('data')))
+
+  @jtu.with_explicit_mesh((2,), ('x',), axis_types=(AxisType.Auto,))
+  def test_smap_auto_error(self, mesh):
+    with self.assertRaisesRegex(TypeError, "in_axes was not specified"):
+      smap(lambda x: x * 2, out_axes=0, axis_name='x')(np.arange(4))
+
+  @jtu.with_explicit_mesh((2, 2), ('x', 'y'),
+                          axis_types=(AxisType.Explicit, AxisType.Auto))
+  def test_smap_auto_explicit(self, mesh):
+    def f(x):
+      self.assertEqual(x.aval.vma, {'x'})
+      return x * 2
+
+    arr = jax.device_put(np.arange(4), P('x'))
+    out = jax.jit(smap(f, out_axes=0, axis_name='x'))(arr)
+    self.assertArraysEqual(out, np.arange(4) * 2)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P('x')))
+
+    def g(x):
+      self.assertEqual(x.aval.vma, {'y'})
+      return x * 2
+
+    arr = jax.device_put(np.arange(4), P('y'))
+    out = jax.jit(smap(g, in_axes=0, out_axes=0, axis_name='y'))(arr)
+    self.assertArraysEqual(out, np.arange(4) * 2)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P('y')))
+
+  @jtu.with_explicit_mesh((2, 2), ('x', 'y'),
+                          axis_types=(AxisType.Explicit, AxisType.Auto))
+  def test_smap_auto_explicit_nest(self, mesh):
+    def g(b):
+      self.assertEqual(b.aval.vma, {'x', 'y'})
+      return jnp.sin(b)
+
+    def f(a):
+      self.assertEqual(a.aval.vma, {'y'})
+      b = a * 2
+      return smap(g, in_axes=1, out_axes=1, axis_name='x')(b)
+
+    arr = jax.device_put(np.arange(16).reshape(8, 2), P('y'))
+    jax.jit(smap(f, in_axes=0, out_axes=0, axis_name='y'))(arr)  # doesn't crash
+
+  @jtu.with_explicit_mesh((2, 2), ('x', 'y'),
+                          axis_types=(AxisType.Explicit, AxisType.Auto))
+  def test_smap_auto_explicit_nest_inner_none(self, mesh):
+    def g(b):
+      self.assertEqual(b.aval.vma, {'y'})
+      return jnp.sin(b)
+
+    def f(a):
+      self.assertEqual(a.aval.vma, {'y'})
+      b = a * 2
+      # Going manual over explicit axis `x` but in_axes is Infer and since
+      # input has no sharding, it will default to None.
+      return smap(g, out_axes=1, axis_name='x')(b)
+
+    arr = jax.device_put(np.arange(16).reshape(8, 2), P('y'))
+    jax.jit(smap(f, in_axes=0, out_axes=0, axis_name='y'))(arr)  # doesn't crash
+
+  @jtu.with_explicit_mesh((2, 2), ('x', 'y'),
+                          axis_types=(AxisType.Explicit, AxisType.Auto))
+  def test_smap_auto_explicit_nest_mesh_call_time(self, mesh):
+    @partial(smap, in_axes=1, out_axes=1, axis_name='x')
+    def g(b):
+      return jnp.sin(b)
+
+    @partial(smap, in_axes=0, out_axes=0, axis_name='y')
+    def f(a):
+      self.assertEqual(a.aval.vma, {'y'})
+      b = a * 2
+      return g(b)
+
+    arr = jax.device_put(np.arange(16).reshape(8, 2), P('y'))
+    jax.jit(f)(arr)  # doesn't crash
 
 
 class FunSpec(NamedTuple):

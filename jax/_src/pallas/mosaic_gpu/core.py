@@ -33,6 +33,7 @@ from jax._src import pretty_printer as pp
 from jax._src import tree_util
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.pallas import core as pallas_core
+from jax._src.pallas import helpers as pallas_helpers
 from jax._src.pallas import primitives as pallas_primitives
 import jax._src.pallas.utils as pallas_utils
 from jax._src.state import discharge as state_discharge
@@ -70,7 +71,7 @@ def is_trivial_index(idx, shape) -> bool:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class GPUCompilerParams(pallas_core.CompilerParams):
+class CompilerParams(pallas_core.CompilerParams):
   """Mosaic GPU compiler parameters.
 
   Attributes:
@@ -107,7 +108,7 @@ class GPUCompilerParams(pallas_core.CompilerParams):
       )
 
 
-class GPUMemorySpace(enum.Enum):
+class MemorySpace(enum.Enum):
   #: Global memory.
   GMEM = "gmem"
   #: Shared memory.
@@ -144,7 +145,7 @@ class SemaphoreType(enum.Enum):
       dtype = pallas_core.BarrierSemaphore()
     else:
       dtype = pallas_core.Semaphore()
-    return pallas_core.MemoryRef(shape, dtype, GPUMemorySpace.GMEM)
+    return pallas_core.MemoryRef(shape, dtype, MemorySpace.GMEM)
 
   def get_array_aval(self) -> jax_core.ShapedArray:
     return self(()).get_array_aval()
@@ -174,7 +175,7 @@ def kernel(
     out_shape: object,
     *,
     scratch_shapes: pallas_core.ScratchShapeTree = (),
-    compiler_params: object | None = None,
+    compiler_params: pallas_core.CompilerParams | None = None,
     **mesh_kwargs: object,
 ):
   if unwrap_out := not isinstance(out_shape, (tuple, list)):
@@ -182,7 +183,7 @@ def kernel(
   def wrapper(*operands):
     def stateful(operand_and_out_refs):
       operand_refs, out_refs = operand_and_out_refs
-      mesh = GPUMesh(**mesh_kwargs)
+      mesh = Mesh(**mesh_kwargs)
       thread_name = mesh.thread_name if mesh.thread_name is not None else ()
       def cmap_body():
         pallas_primitives.run_scoped(
@@ -194,7 +195,7 @@ def kernel(
           mesh, compiler_params=compiler_params
       )(cmap_body)
     _, outs = state_discharge.run_state(stateful)(
-        (operands, jax.tree.map(jnp.zeros_like, out_shape))
+        (operands, pallas_helpers.empty_like(out_shape, backend="mosaic_gpu"))
     )
     return outs[0] if unwrap_out else outs
   return wrapper
@@ -202,6 +203,8 @@ def kernel(
 
 def _is_known_divisible(value, divisor, fuel=10) -> bool:
   """Returns True if the value is statically known to be divisible by the divisor."""
+  if divisor == 1:
+    return True
   if fuel < 0:
     return False
   if not isinstance(value.owner, ir.Operation):
@@ -231,7 +234,7 @@ class GPUMemoryRef(pallas_core.MemoryRef):
   collective: bool | None = dataclasses.field(default=None, kw_only=True)
 
   def __post_init__(self):
-    if self.memory_space != GPUMemorySpace.TMEM:
+    if self.memory_space != MemorySpace.TMEM:
       if self.packed is not None:
         raise ValueError("Packed option is only supported for TMEM.")
       if self.collective is not None:
@@ -241,7 +244,7 @@ class GPUMemoryRef(pallas_core.MemoryRef):
     aval = jax_core.ShapedArray(self.shape, self.dtype)
     for t in self.transforms:
       aval = t(aval)
-    if self.memory_space == GPUMemorySpace.TMEM:
+    if self.memory_space == MemorySpace.TMEM:
       ref = pallas_core.TransformedRef(
           AbstractTMEMRef(aval,
                           memory_space=self.memory_space,
@@ -624,7 +627,7 @@ def remote_ref(
 ) -> pallas_core.TransformedRef:
   """Translate memref to a symmetric memref on a peer device."""
   if not isinstance(ref, pallas_core.TransformedRef):
-    if not isinstance(jax_core.get_aval(ref), pallas_core.AbstractMemoryRef):
+    if not isinstance(jax_core.get_aval(ref), state_types.AbstractRef):
       raise TypeError("ref must be a reference")
     ref = pallas_core.TransformedRef(ref, transforms=())
   return pallas_core.TransformedRef(
@@ -637,7 +640,7 @@ def transform_ref(
     transform: state_types.Transform
 ) -> pallas_core.TransformedRef:
   if not isinstance(ref, pallas_core.TransformedRef):
-    if not isinstance(jax_core.get_aval(ref), pallas_core.AbstractMemoryRef):
+    if not isinstance(jax_core.get_aval(ref), state_types.AbstractRef):
       raise TypeError("ref must be a reference")
     ref = pallas_core.TransformedRef(ref, transforms=())
   return pallas_core.TransformedRef(
@@ -782,7 +785,7 @@ class UnswizzleRef(state_types.Transform):
 
 
 @dataclasses.dataclass
-class GPUBlockSpec(pallas_core.BlockSpec):
+class BlockSpec(pallas_core.BlockSpec):
   transforms: Sequence[MemoryRefTransform] = ()
 
   def to_block_mapping(
@@ -814,10 +817,10 @@ class GPUBlockSpec(pallas_core.BlockSpec):
     )
 
 
-GMEM = GPUMemorySpace.GMEM
-SMEM = GPUMemorySpace.SMEM
-TMEM = GPUMemorySpace.TMEM
-REGS = GPUMemorySpace.REGS
+GMEM = MemorySpace.GMEM
+SMEM = MemorySpace.SMEM
+TMEM = MemorySpace.TMEM
+REGS = MemorySpace.REGS
 
 
 class barrier_dtype(dtypes.extended):
@@ -900,7 +903,7 @@ class WGMMAAccumulatorRef:
           "Preinitialized WGMMAAccumulatorRef only supported in pl.run_state."
       )
     return WGMMAAbstractAccumulatorRef(
-        jax_core.ShapedArray(shape=self.shape, dtype=self.dtype), GPUMemorySpace.REGS
+        jax_core.ShapedArray(shape=self.shape, dtype=self.dtype), MemorySpace.REGS
     )
 
   @staticmethod
@@ -910,7 +913,7 @@ class WGMMAAccumulatorRef:
 
 def _wgmma_ref_type_mapping(ref: WGMMAAccumulatorRef):
   aval = WGMMAAbstractAccumulatorRef(
-      jax_core.ShapedArray(shape=ref.shape, dtype=ref.dtype), GPUMemorySpace.REGS
+      jax_core.ShapedArray(shape=ref.shape, dtype=ref.dtype), MemorySpace.REGS
   )
   return aval, ref._init
 state_types._ref_type_aval_mappings[WGMMAAccumulatorRef] = _wgmma_ref_type_mapping
@@ -959,7 +962,7 @@ class AbstractTMEMRef(AbstractMemoryRef):
 _WARPGROUP_AXIS_NAME = object()
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class GPUMesh:
+class Mesh:
   grid: Sequence[int] = ()
   grid_names: Sequence[str] = ()
   cluster: Sequence[int] = ()
@@ -1046,15 +1049,15 @@ def _gpu_mesh_discharge_rule(
     cost_estimate,
     name,
 ):
-  if not isinstance(mesh, GPUMesh):
-    raise TypeError(f"Mesh must be a GPUMesh, got {type(mesh)}")
-  if compiler_params and not isinstance(compiler_params, GPUCompilerParams):
+  if not isinstance(mesh, Mesh):
+    raise TypeError(f"Mesh must be a `plgpu.Mesh`, got {type(mesh)}")
+  if compiler_params and not isinstance(compiler_params, CompilerParams):
     raise TypeError(
-        "Compiler params must be a GPUCompilerParams, got"
+        "Compiler params must be a `plgpu.CompilerParams`, got"
         f" {type(compiler_params)}"
     )
   if not compiler_params:
-    compiler_params = GPUCompilerParams()
+    compiler_params = CompilerParams()
   return pallas_core.default_mesh_discharge_rule(
       in_avals,
       out_avals,
@@ -1070,7 +1073,7 @@ def _gpu_mesh_discharge_rule(
   )
 
 
-pallas_core._core_map_mesh_rules[GPUMesh] = _gpu_mesh_discharge_rule
+pallas_core._core_map_mesh_rules[Mesh] = _gpu_mesh_discharge_rule
 
 
 class MemoryEffect(jax_core.Effect):

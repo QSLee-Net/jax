@@ -441,6 +441,7 @@ def TPU_RelayoutOp : TPU_Op<"relayout", [SameOperandsAndResultType]> {
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$output);
   let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
+  let hasVerifier = 1;
 }
 
 def TPU_PackMaskOp : TPU_Op<"pack_vmsk", [Pure, SameTypeOperands]> {
@@ -465,10 +466,19 @@ def TPU_GatherOp : TPU_Op<"gather", [Pure]> {
   }];
 }
 
-def TPU_DynamicGatherOp : TPU_Op<"dynamic_gather", [Pure]> {
+def TPU_DynamicGatherOp : TPU_Op<"dynamic_gather", [Pure, SameOperandsAndResultShape, AllTypesMatch<["source", "output"]>]> {
+  let description = [{
+    Gathers elements from `source` using `indices`.
+
+    Given a shape `N0 x N1 x ...`, `output[i0, i1, ...]` is given by
+    `input[j0, j1, ...]` where `jn = indices[i0, i1, ...] mod Ni` for
+    `n = dimension` and `jn = in` otherwise.
+
+    Similar to `np.take_along_axis`, except that OOB indices wrap.
+  }];
   let arguments = (ins
     AnyVectorOfNonZeroRank:$source,
-    AnyVectorOfNonZeroRank:$indices,
+    VectorOfNonZeroRankOf<[AnyInteger]>:$indices,
     I32Attr:$dimension
   );
   let results = (outs AnyVectorOfNonZeroRank:$output);
@@ -498,6 +508,14 @@ def TPU_FPToSIOp : TPU_Op<"fptosi", [Pure, ElementwiseMappable]> {
   let results = (outs AnyVectorOfAnyRank:$output);
   let assemblyFormat = [{ $input attr-dict `:` type($input) `->` type($output) }];
   let hasCanonicalizeMethod = 1;
+}
+
+// Internal operation. All arith.sitofp operations that change the bitwidth
+// must be canonicalized to this operation.
+def TPU_SIToFPOp : TPU_Op<"sitofp", [Pure, ElementwiseMappable]> {
+  let arguments = (ins AnyVectorOfAnyRank:$in, TPU_RoundingModeEnum:$rounding_mode);
+  let results = (outs AnyVectorOfAnyRank:$output);
+  let assemblyFormat = [{ $in attr-dict `:` type($in) `->` type($output) }];
 }
 
 def TPU_DotDimensionNumbersAttr : TPU_Attr<"DotDimensionNumbers", "dot_dimension_numbers"> {
@@ -1005,6 +1023,8 @@ def CanonicalizeMosaicPass : Pass<"tpu-canonicalize-mosaic", "::mlir::func::Func
   let options = [
     Option<"hardware_generation", "hardware-generation", "int", /*default=*/"-1", "">,
     Option<"compatibility_mode", "compatibility-mode", "bool", /*default=*/"1", "">,
+    Option<"lane_count", "lane-count", "int", /*default=*/"128", "">,
+    Option<"sublane_count", "sublane-count", "int", /*default=*/"8", "">,
   ];
 }
 

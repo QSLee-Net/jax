@@ -122,6 +122,8 @@ cc_library(
     # Linker may prune these symbols if they are not explicitly exported.
     linkopts = [
         "-Wl,--export-dynamic-symbol='mosaic_gpu_*'",
+        "-Wl,--export-dynamic-symbol='nvshmem_my_pe'",
+        "-Wl,--export-dynamic-symbol='nvshmem_ptr'",
         "-Wl,--export-dynamic-symbol='nvshmemx_barrier_all_on_stream'",
         "-Wl,--export-dynamic-symbol='nvshmemx_cumodule_init'",
         "-Wl,--export-dynamic-symbol='nvshmemx_init_status'",
@@ -149,8 +151,6 @@ cc_library(
         ":nvshmem",
         ":passes",
         ":target",
-        "//jaxlib/cuda:cuda_vendor",
-        "//jaxlib/mosaic/dialect/gpu:mosaic_gpu",
         "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
@@ -200,11 +200,16 @@ cc_library(
         "@llvm-project//mlir:UBToLLVM",
         "@llvm-project//mlir:VectorDialect",
         "@llvm-project//mlir:VectorToLLVM",
-        "@tsl//tsl/profiler/lib:traceme",
+        "//jaxlib/cuda:cuda_vendor",
+        "//jaxlib/mosaic/dialect/gpu:mosaic_gpu",
         "@xla//xla/ffi",
         "@xla//xla/ffi:ffi_api",
         "@xla//xla/service:custom_call_status",
         "@xla//xla/service:custom_call_target_registry",
+        "@tsl//tsl/profiler/lib:traceme",
+        # TODO(slebedev): Remove once enable-line-info is merged into the upstream
+        # ensure-debug-info-scope-on-llvm-func pass in MLIR.
+        "@triton//:TritonLLVMIR",
     ],
     alwayslink = True,
 )

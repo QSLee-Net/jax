@@ -20,7 +20,7 @@ import contextlib
 import dataclasses
 from functools import partial
 import inspect
-import itertools
+import itertools as it
 import logging
 import weakref
 from typing import NamedTuple, Any, Union, cast
@@ -77,7 +77,7 @@ from jax._src.tree_util import (
     treedef_children, broadcast_prefix, all_leaves, prefix_errors, keystr,
     PyTreeDef, none_leaf_registry as none_lr, tree_map, tree_flatten_with_path)
 from jax._src.util import (
-    HashableFunction, safe_map, safe_zip, wraps, tuple_insert,
+    HashableFunction, safe_map, safe_zip, wraps,
     distributed_debug_log, split_list, split_list_checked, weakref_lru_cache,
     merge_lists, subs_list, fun_name, fun_qual_name)
 from jax._src.attrs import (Box, List, dne_sentinel, jax_setattr, jax_getattr,
@@ -94,48 +94,6 @@ MeshSharding = Union[NamedSharding, UnspecifiedValue, AUTO]
 MeshShardingMinusUnspecified = Union[NamedSharding, AUTO]
 
 logger = logging.getLogger(__name__)
-
-
-def _find_arg_mismatch(arg_list, fails, fun_name):
-  mismatched_args_msg = []
-  def mismatch(err):
-    for name, inp_da, aval in arg_list:
-      if err.m_type == pxla.MismatchType.ARG_SHARDING and err.da == inp_da:
-        mismatched_args_msg.append(
-            f"argument {name} of {fun_name} with shape {aval.str_short()} and "
-            f"{err._dev_ids_plat_str}")
-        break
-  first_err, second_err = fails
-  mismatch(first_err)
-  mismatch(second_err)
-  return mismatched_args_msg
-
-
-def _device_assignment_mismatch_error(fun_name, fails, args_flat, api_name,
-                                      arg_names):
-  arg_list = []
-  if arg_names is None:
-    arg_names = [''] * len(args_flat)
-  for a, n in zip(args_flat, arg_names):
-    da = (a.sharding._device_assignment
-          if getattr(a, 'sharding', None) is not None else None)
-    arg_list.append((n, da, core.shaped_abstractify(a)))
-
-  mismatched_args_msg = _find_arg_mismatch(arg_list, fails, fun_name)
-
-  if len(mismatched_args_msg) == 2:
-    first, second = mismatched_args_msg  # pytype: disable=bad-unpacking
-    extra_msg = f" Got {first} and {second}"
-  elif len(mismatched_args_msg) == 1:
-    first, second  = fails
-    # Choose the failure left which is not already covered by ARG_SHARDING.
-    left = second if first.m_type == pxla.MismatchType.ARG_SHARDING else first
-    extra_msg = f" Got {mismatched_args_msg[0]} and{left._str(api_name)}"
-  else:
-    first, second = fails
-    extra_msg = f" Got{first._str(api_name)} and{second._str(api_name)}"
-  msg = (f"Received incompatible devices for {api_name}ted computation.{extra_msg}")
-  return msg
 
 
 class PjitInfo(NamedTuple):
@@ -188,7 +146,8 @@ def _python_pjit_helper(fun: Callable, jit_info: PjitInfo, *args, **kwargs):
     args_flat = [*init_states, *args_flat]
 
   try:
-    if core.trace_state_clean() and not config.debug_key_reuse.value:
+    if (core.trace_state_clean() and not config.debug_key_reuse.value
+        and not p.params['jaxpr'].jaxpr.is_high):
       args_flat = map(core.full_lower, args_flat)
       core.check_eval_args(args_flat)
       out_flat, compiled, profiler = _pjit_call_impl_python(*args_flat, **p.params)
@@ -196,10 +155,10 @@ def _python_pjit_helper(fun: Callable, jit_info: PjitInfo, *args, **kwargs):
       out_flat = pjit_p.bind(*args_flat, **p.params)
       compiled = None
       profiler = None
-  except pxla.DeviceAssignmentMismatchError as e:
+  except stages.DeviceAssignmentMismatchError as e:
     fails, = e.args
     fun_name = getattr(fun, '__qualname__', getattr(fun, '__name__', str(fun)))
-    msg = _device_assignment_mismatch_error(
+    msg = stages._device_assignment_mismatch_error(
         fun_name, fails, args_flat, 'jit', p.arg_names)
     raise ValueError(msg) from None
   except xla.InvalidInputException as e:
@@ -217,10 +176,10 @@ def _python_pjit_helper(fun: Callable, jit_info: PjitInfo, *args, **kwargs):
               f"Argument '{name}' of shape {aval.str_short()} of type"
               f' {type(arg)} is not a valid JAX type.') from e
       raise AssertionError("Unreachable") from e
-  except dispatch.InternalFloatingPointError as e:
+  except api_util.InternalFloatingPointError as e:
     if getattr(fun, '_apply_primitive', False):
       raise FloatingPointError(f"invalid value ({e.ty}) encountered in {fun.__qualname__}") from None
-    dispatch.maybe_recursive_nan_check(e, fun, args, kwargs)
+    api_util.maybe_recursive_nan_check(e, fun, args, kwargs)
 
   if p.box_data:
     box_treedef, out_tree = p.out_tree.children()
@@ -391,11 +350,17 @@ def jit_lower(jit_func, *args, **kwargs):
 @api_boundary
 def jit_eval_shape(jit_func, *args, **kwargs):
   p, _ = _infer_params(jit_func._fun, jit_func._jit_info, args, kwargs)
-  out_s = [None if isinstance(s, UnspecifiedValue) else s for s in p.params['out_shardings']]
-  # TODO(yashkatariya): Add `Layout` to SDS.
-  out = [api.ShapeDtypeStruct(x.shape, x.dtype, sharding=s,
-                              weak_type=x.weak_type)
-         for x, s in zip(p.params['jaxpr'].out_avals, out_s)]
+  out_shardings = [None if isinstance(s, UnspecifiedValue) else s
+                   for s in p.params['out_shardings']]
+  out = []
+  for a, out_s in zip(p.params['jaxpr'].out_avals, out_shardings):
+    if out_s is None:
+      s = a.sharding if a.sharding.mesh._are_all_axes_explicit else out_s
+    else:
+      s = out_s
+    # TODO(yashkatariya): Add `Layout` to SDS.
+    out.append(api.ShapeDtypeStruct(a.shape, a.dtype, sharding=s,
+                                    weak_type=a.weak_type))
   return tree_unflatten(p.out_tree, out)
 
 def jit_evict_fn(self):
@@ -1592,6 +1557,58 @@ pjit_p = core.Primitive("pjit")
 pjit_p.multiple_results = True
 pjit_p.skip_canonicalization = True
 
+def _is_high(jaxpr, **_) -> bool:
+  return jaxpr.jaxpr.is_high
+pjit_p.is_high = _is_high  # type: ignore
+
+def _to_lojax( *hi_args, jaxpr, **params):
+  params, num_mutants = _lojax_expand_params(jaxpr, **params)
+
+  lo_args = [lo_val for t, hi_val in zip(jaxpr.in_avals, hi_args)
+             for lo_val in t.lower_val(hi_val)]
+  lo_jaxpr = pe.lower_jaxpr(jaxpr)
+  all_outs = pjit_p.bind(*lo_args, jaxpr=lo_jaxpr, **params)
+  out_mut, lo_outs = split_list(all_outs, [num_mutants])
+
+  out_mut_ = iter(out_mut)
+  in_idx = {v: i for i, v in enumerate(jaxpr.jaxpr.invars)}
+  for var, ty in jaxpr.jaxpr.final_typechange_env.items():
+    ty.set(hi_args[in_idx[var]], *it.islice(out_mut_, len(ty.lo_ty())))
+  assert next(out_mut_, None) is None
+
+  lo_outs_ = iter(lo_outs)
+  hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+             for t in jaxpr.out_avals]
+  assert next(lo_outs_, None) is None
+
+  return hi_outs
+pjit_p.to_lojax = _to_lojax
+
+def _lojax_expand_params(
+    hi_jaxpr, *, donated_invars, in_shardings, in_layouts, out_shardings,
+    out_layouts, **params):
+  # some pjit params match the length of hi_jaxpr.invars/outvars, so when
+  # lowering we must expand them to match their number of lojax types
+  def expand(hi_tys, xs):
+    return tuple(y for hi, x in zip(hi_tys, xs) for y in (x,) * len(hi.lo_ty()))
+  donated_invars = expand(hi_jaxpr.in_avals , donated_invars)
+  in_shardings   = expand(hi_jaxpr.in_avals , in_shardings  )
+  in_layouts     = expand(hi_jaxpr.in_avals , in_layouts    )
+  out_shardings  = expand(hi_jaxpr.out_avals, out_shardings )
+  out_layouts    = expand(hi_jaxpr.out_avals, out_layouts   )
+
+  # also, the lo_jaxpr has pure outputs corresponding to mutable hi_jaxpr types
+  num_mutants = sum(len(hi_ty.lo_ty()) for hi_ty in
+                    hi_jaxpr.jaxpr.final_typechange_env.values())
+  out_shardings = (UNSPECIFIED,) * num_mutants + out_shardings
+  out_layouts = (None,) * num_mutants + out_layouts
+
+  new_params = dict(params, donated_invars=donated_invars,
+                    in_shardings=in_shardings, in_layouts=in_layouts,
+                    out_shardings=out_shardings, out_layouts=out_layouts)
+  return new_params, num_mutants
+
+
 def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings, in_avals):
   # If device or backend is set, return the default layout. This is because you
   # can pass arrays on cpu (with untiled layouts) to jit with backend='tpu'
@@ -1687,7 +1704,7 @@ def _resolve_in_shardings(args, pjit_in_shardings: Sequence[PjitSharding]
     if isinstance(arg_s, PmapSharding):
       continue
     if getattr(a, '_committed', True):
-      committed_arg_shardings.append((arg_s, pxla.MismatchType.ARG_SHARDING, None))
+      committed_arg_shardings.append((arg_s, stages.MismatchType.ARG_SHARDING, None))
 
   resolved_in_shardings: list[PjitSharding] = []
   for arg, pjit_in_s in zip(args, pjit_in_shardings):
@@ -2137,12 +2154,6 @@ def _pjit_batcher(axis_data, vals_in,
 batching.fancy_primitive_batchers[pjit_p] = _pjit_batcher
 batching.ragged_prop_rules[pjit_p] = batching.ragged_mask_no_op_rule
 
-def _insert_axis_partitions(spec, dim, val):
-  too_short = dim - len(spec)
-  if too_short > 0:
-    spec += (None,) * too_short
-  new_partitions = tuple_insert(spec, dim, val)  # type: ignore
-  return PartitionSpec(*new_partitions)
 
 def _pjit_batcher_for_sharding(
     s: Sharding | UnspecifiedValue,
@@ -2156,7 +2167,7 @@ def _pjit_batcher_for_sharding(
       return s
     if isinstance(s, NamedSharding) and isinstance(s.mesh, AbstractMesh):
       return NamedSharding(
-          s.mesh, _insert_axis_partitions(s.spec, dim, PartitionSpec.UNCONSTRAINED))
+          s.mesh, pxla.batch_spec(s.spec, dim, PartitionSpec.UNCONSTRAINED))
     new_op = hlo_s.to_proto().clone()
     tad = list(new_op.tile_assignment_dimensions)
     tad.insert(dim, 1)  # type: ignore
@@ -2168,7 +2179,7 @@ def _pjit_batcher_for_sharding(
   else:
     if isinstance(s, NamedSharding) and isinstance(s.mesh, AbstractMesh):
       return NamedSharding(
-          s.mesh, _insert_axis_partitions(s.spec, dim, spmd_axis_name))
+          s.mesh, pxla.batch_spec(s.spec, dim, spmd_axis_name))
     if isinstance(s, NamedSharding):
       mesh = s.mesh
     if mesh is None or mesh.empty:
@@ -2181,7 +2192,7 @@ def _pjit_batcher_for_sharding(
           f' manager scope{s!r}')
     spec = parse_flatten_op_sharding(hlo_s, mesh)[0]
     return NamedSharding(
-        mesh, _insert_axis_partitions(spec, dim, spmd_axis_name))
+        mesh, pxla.batch_spec(spec, dim, spmd_axis_name))
 
 
 def _pjit_jvp(primals_in, tangents_in,
@@ -2551,7 +2562,7 @@ def _pjit_transpose(cts_in, *primals_in,
         keep_unused=keep_unused,
         inline=inline,
         compiler_options_kvs=compiler_options_kvs)
-  except dispatch.InternalFloatingPointError as e:
+  except api_util.InternalFloatingPointError as e:
     print("Invalid nan value encountered in the backward pass of a jax.jit "
           "function. Calling the de-optimized backward pass.")
     try:
@@ -2561,7 +2572,7 @@ def _pjit_transpose(cts_in, *primals_in,
     else:
       # If control reaches this line, we got a NaN on the output of `compiled`
       # but not `fun.call_wrapped` on the same arguments. Let's tell the user.
-      dispatch._raise_no_nan_in_deoptimized(e)
+      api_util._raise_no_nan_in_deoptimized(e)
 
   if attrs_tracked:
     final_states, nz_cts_out = split_list(nz_cts_out, [num_attr_outs])
@@ -2692,7 +2703,13 @@ def check_shardings_are_auto(shardings_flat):
       raise ValueError(
           'The spec of NamedSharding passed to with_sharding_constraint can'
           f' only refer to Auto axes of the mesh. Got spec={s.spec} and'
-          f' mesh={mesh}')
+          f' mesh={mesh}. You probably meant to use `reshard` API?')
+
+  cur_mesh = mesh_lib.get_abstract_mesh()
+  if cur_mesh._are_all_axes_explicit:
+    raise ValueError(
+        'with_sharding_constraint cannot be used when all axes of the mesh are'
+        ' of type `Explicit`. Please use the `reshard` API.')
 
 
 def with_sharding_constraint(x, shardings):
@@ -2970,6 +2987,11 @@ def reshard(xs, out_shardings):
   out_flat = []
   for x, x_aval, s in safe_zip(x_flat, x_avals_flat, shardings_flat):
     ds = canonicalize_sharding(s, 'reshard')
+    if ds is None:
+      raise ValueError(
+          'Reshard should only be used with out_shardings which are non-None '
+          'and have a nonempty mesh. Got sharding {s}.'
+      )
     ds = ds.with_spec(ds.spec._normalized_spec_for_aval(x_aval.ndim))  # pytype: disable=attribute-error
     out_flat.append(reshard_p.bind(x, dst_sharding=ds))
   return tree_unflatten(treedef, out_flat)
@@ -3233,7 +3255,7 @@ def _flatten_boxes(dbg, args, kwargs):
     return args, kwargs, []
   box_data = []
   id_first_occurrences = {}
-  idxs = itertools.count()
+  idxs = it.count()
   def visit(x):
     i = next(idxs)
     if (isinstance(x, (Box, List)) and

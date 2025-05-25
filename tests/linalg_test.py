@@ -69,7 +69,9 @@ def _axis_for_ndim(ndim: int) -> Iterator[None | int | tuple[int, ...]]:
 
 def osp_linalg_toeplitz(c: np.ndarray, r: np.ndarray | None = None) -> np.ndarray:
   """scipy.linalg.toeplitz with v1.17+ batching semantics."""
-  if scipy_version >= (1, 17, 0):
+  # TODO(dfm,jakevdp): Remove dev check after upstream PR is merged:
+  # https://github.com/scipy/scipy/issues/21466.
+  if scipy_version >= (1, 17, 0) and "dev0" not in scipy.version.version:
     return scipy.linalg.toeplitz(c, r)
   elif r is None:
     c = np.atleast_1d(c)
@@ -2217,7 +2219,10 @@ class LaxLinalgTest(jtu.JaxTestCase):
       build_tri = jax.vmap(build_tri)
 
     a = build_tri(dl, d, du)
-    self.assertAllClose(a @ x, b, atol=5e-5, rtol=1e-4)
+    with jax.default_matmul_precision("float32"):
+      self.assertAllClose(a @ x, b, atol={
+          np.float32: 1e-3, np.float64: 1e-10, np.complex64: 1e-3,
+          np.complex128: 1e-10})
 
   def test_tridiagonal_solve_endpoints(self):
     # tridagonal_solve shouldn't depend on the endpoints being explicitly zero.

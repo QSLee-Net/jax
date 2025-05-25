@@ -35,10 +35,11 @@ from jax._src import mesh_utils
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir.dialects import sdy
 from jax._src.named_sharding import (  # noqa: F401
-    SdyArraySharding, SdyDimSharding, UnspecifiedValue, AUTO,
+    SdyArray, SdyDim, UnspecifiedValue, AUTO,
     _check_unique_resources, NamedSharding, UNSPECIFIED,
     ArrayMapping, ArrayMappingOrAutoOrUnspecified, get_array_mapping,
-    array_mapping_to_axis_resources, named_sharding_to_xla_hlo_sharding)
+    array_mapping_to_axis_resources, named_sharding_to_xla_hlo_sharding,
+    modify_sdy_sharding_wrt_axis_types)
 from jax._src.op_shardings import (
     are_op_shardings_equal, get_num_ways_dim_sharded, is_op_sharding_replicated)
 from jax._src.partition_spec import PartitionSpec
@@ -87,33 +88,12 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
 
 
 @dataclasses.dataclass
-class SdyArrayShardingList:
-  shardings: Sequence[SdyArraySharding]
+class SdyArrayList:
+  shardings: Sequence[SdyArray]
 
   def build(self) -> sdy.TensorShardingPerValueAttr:
     return sdy.TensorShardingPerValueAttr.get(
         [sharding.build() for sharding in self.shardings])
-
-
-# TODO(yashkatariya): Upstream this into `_to_sdy_sharding` maybe with an extra
-# parameter to it `_to_sdy_sharding(self, ndim, modify_wrt_axis_types=False)`
-def modify_sdy_sharding_wrt_axis_types(sdy_sharding: SdyArraySharding, mesh):
-  if mesh._any_axis_auto:
-    dim_shardings, used_axes = [], []  # type: ignore
-    for d in sdy_sharding.dimension_shardings:
-      # TODO(yashkatariya): Maybe if any mesh axis is auto, mark all axes as open?
-      dim_shardings.append(SdyDimSharding(axes=[], is_open=True)
-                           if not d.axes and not d.is_open else d)
-      used_axes.extend(d.axes)
-    remaining_axes = set(mesh.axis_names) - set(used_axes)
-    # Sort wrt mesh axis names so order is deterministic and doesn't hang in
-    # McJAX.
-    remaining_axes = [n for n in mesh.axis_names if n in remaining_axes]
-    replicated_axes = tuple(r for r in remaining_axes
-                            if mesh._name_to_type[r] == mesh_lib.AxisType.Explicit)
-    return SdyArraySharding(sdy_sharding.mesh_shape, dim_shardings,
-                            sdy_sharding.logical_device_ids, replicated_axes)
-  return sdy_sharding
 
 
 replicated_hlo_sharding = xc.HloSharding.replicate()
@@ -185,10 +165,10 @@ class SingleDeviceSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return replicated_hlo_sharding
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    sdy_dim_sharding = [SdyDimSharding(axes=[], is_open=False)
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
+    sdy_dim_sharding = [SdyDim(axes=[], is_open=False)
                         for _ in range(num_dimensions)]
-    return SdyArraySharding(None, sdy_dim_sharding)
+    return SdyArray(mesh_shape=None, dim_shardings=sdy_dim_sharding)
 
   @property
   def is_fully_replicated(self) -> bool:
@@ -330,8 +310,8 @@ class PmapSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     raise NotImplementedError("pmap doesn't use OpSharding.")
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    raise NotImplementedError("pmap doesn't use SdyArraySharding.")
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
+    raise NotImplementedError("pmap doesn't use SdyArray.")
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:
@@ -540,9 +520,9 @@ class PositionalSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return _positional_sharding_to_xla_hlo_sharding(self, num_dimensions)
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
     raise NotImplementedError(
-        "PositionalSharding can't be converted to an SdyArraySharding.")
+        "PositionalSharding can't be converted to an SdyArray.")
 
   @functools.cached_property
   def is_fully_addressable(self) -> bool:
@@ -657,9 +637,26 @@ class GSPMDSharding(jsharding.Sharding):
   def _to_xla_hlo_sharding(self, num_dimensions: int) -> xc.HloSharding:
     return self._hlo_sharding
 
-  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArraySharding:
-    raise NotImplementedError(
-        "GSPMDSharding can't be converted to SdyArraySharding.")
+  def _to_sdy_sharding(self, num_dimensions: int) -> SdyArray:
+    if self._hlo_sharding.tuple_elements():
+      raise TypeError(
+          f'Cannot convert GSPMDSharding {self._hlo_sharding} into SdyArray.')
+    elif self._hlo_sharding.is_replicated():
+      empty_mesh = mesh_lib.AbstractMesh((), ())
+      return NamedSharding(empty_mesh, PartitionSpec())._to_sdy_sharding(
+          num_dimensions)
+    elif self._hlo_sharding.is_tiled():
+      if not self._hlo_sharding.is_tile_assignment_iota():
+        raise TypeError(
+            f'Cannot convert GSPMDSharding {self._hlo_sharding} into SdyArray.')
+      axis_sizes = tuple(self._hlo_sharding.get_axis_sizes())
+      axis_names = tuple(f'_axis_{i}' for i in range(len(axis_sizes)))
+      mesh = mesh_lib.AbstractMesh(axis_sizes, axis_names)
+      return _gspmd_to_named_sharding_via_mesh(self, mesh)._to_sdy_sharding(
+          num_dimensions)
+    else:
+      raise TypeError(
+          f'Cannot convert GSPMDSharding {self._hlo_sharding} into SdyArray.')
 
   @functools.cached_property
   def is_fully_replicated(self) -> bool:
@@ -1261,10 +1258,12 @@ def create_mesh_pspec_sharding(
 
 
 def _gspmd_to_named_sharding_via_mesh(
-    out_s: GSPMDSharding, mesh: mesh_lib.Mesh) -> NamedSharding:
+    out_s: GSPMDSharding, mesh: mesh_lib.Mesh | mesh_lib.AbstractMesh
+) -> NamedSharding:
   spec = parse_flatten_op_sharding(out_s._hlo_sharding, mesh)[0]
   return create_mesh_pspec_sharding(
       mesh, spec, memory_kind=out_s.memory_kind)
+
 
 def flatten_spec(spec):
   out = []

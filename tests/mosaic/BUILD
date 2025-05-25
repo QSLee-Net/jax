@@ -41,7 +41,11 @@ jax_multiplatform_test(
     ],
     deps = [
         "//jax:mosaic_gpu",
-    ] + py_deps("absl/testing") + py_deps("numpy") + py_deps("hypothesis"),
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+        "hypothesis",
+    ]),
 )
 
 jax_multiplatform_test(
@@ -53,7 +57,31 @@ jax_multiplatform_test(
     tags = ["multiaccelerator"],
     deps = [
         "//jax:mosaic_gpu",
-    ] + py_deps("absl/testing") + py_deps("numpy"),
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "gpu_test_distributed",
+    srcs = ["gpu_test_distributed.py"],
+    args = [
+        "--num_processes=2",
+        "--gpus_per_process=1",
+    ],
+    enable_backends = [],
+    enable_configs = ["gpu_h100x2"],
+    env = {"XLA_FLAGS": "--xla_gpu_autotune_level=0 --xla_gpu_experimental_enable_nvshmem=true"},
+    tags = ["multiaccelerator"],
+    deps = [
+        "//jax:experimental",
+        "//jax:mosaic_gpu",
+        "//jax:test_multiprocess",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
 )
 
 jax_py_test(
@@ -83,7 +111,10 @@ jax_py_test(
         "//jax",
         "//jax:mosaic_gpu",
         "//jax:test_util",
-    ] + py_deps("absl/testing"),
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
 )
 
 jax_multiplatform_test(
@@ -95,7 +126,11 @@ jax_multiplatform_test(
     deps = [
         "//jax:mosaic_gpu",
         "//jax/experimental/mosaic/gpu/examples:matmul",
-    ] + py_deps("absl/testing") + py_deps("numpy") + py_deps("hypothesis"),
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+        "hypothesis",
+    ]),
 )
 
 jax_multiplatform_test(
@@ -110,7 +145,10 @@ jax_multiplatform_test(
     ],
     deps = [
         "//jax:mosaic_gpu",
-    ] + py_deps("numpy"),
+    ] + py_deps([
+        "numpy",
+        "absl/testing",
+    ]),
 )
 
 jax_multiplatform_test(

@@ -1235,7 +1235,7 @@ _PALLAS_USE_MOSAIC_GPU = config.bool_state(
 
 _PALLAS_VERBOSE_ERRORS = config.bool_flag(
     "jax_pallas_verbose_errors",
-    default=config.bool_env("JAX_PALLAS_VERBOSE_ERRORS", True),
+    default=config.bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),
     help=(
         "If True, print verbose error messages for Pallas kernels."
     ),
@@ -1551,7 +1551,7 @@ def pallas_call(
       backend-specific dataclass
       (:class:`jax.experimental.pallas.tpu.TPUCompilerParams`,
       :class:`jax.experimental.pallas.triton.TritonCompilerParams`,
-      :class:`jax.experimental.pallas.mosaic_gpu.GPUCompilerParams`) or a dict
+      :class:`jax.experimental.pallas.mosaic_gpu.CompilerParams`) or a dict
       mapping backend name to the corresponding platform-specific dataclass.
     backend: Optional string literal one of  ``"mosaic_tpu"``, ``"triton"`` or
       ``"mosaic_gpu"`` determining the backend to be used. None means let Pallas

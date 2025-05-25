@@ -23,9 +23,6 @@ race_top:PyMember_GetOne
 race_top:new_reference
 race:_Py_IsOwnedByCurrentThread
 
-# https://github.com/python/cpython/issues/129748
-race:mi_block_set_nextx
-
 # https://github.com/python/cpython/issues/128130
 race_top:run_eval_code_obj
 
@@ -41,6 +38,5 @@ race:gemm_oncopy
 race:split_keys_entry_added
 race_top:dict_dict_merge
 
-# https://github.com/python/cpython/issues/132013
-# Fixed on 3.14 and not backported to 3.13
-race_top:frozenset_hash
+# https://github.com/python/cpython/issues/132214
+race:type_update_dict

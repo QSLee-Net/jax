@@ -60,7 +60,6 @@ using ImplicitDim = VectorLayout::ImplicitDim;
 
 static constexpr int kLayoutLog = 10;
 
-
 bool is_fully_replicated(const Layout &layout) {
   static LayoutOffsets replicated_offsets = {std::nullopt, std::nullopt};
   return layout.has_value() && layout->offsets() == replicated_offsets;
@@ -152,6 +151,12 @@ class VectorLayoutInferer {
           return failure();
         }
       } else if (isa<arith::ExtFOp, arith::ExtSIOp>(any_op)) {
+        if (inferExt(&any_op).failed()) {
+          return failure();
+        }
+      } else if (auto op = dyn_cast<tpu::SIToFPOp>(any_op);
+                 op && op.getIn().getType().getElementTypeBitWidth() <
+                           op.getType().getElementTypeBitWidth()) {
         if (inferExt(&any_op).failed()) {
           return failure();
         }
@@ -757,9 +762,28 @@ class VectorLayoutInferer {
     if (op.getType().getRank() < 2) {
       NYI("Unsupported 1D shape");
     }
+    // TODO(b/337384645): Currently we assume {0, 0} offsets in the input
+    // layout. Relax this assumption.
     auto layout = VectorLayout(bitwidth, {0, 0}, nativeTiling(bitwidth),
                                ImplicitDim::kNone);
-    setLayout(op, {layout, kNoLayout}, layout);
+    // Calculate the offsets for the output layout.
+    LayoutOffsets offsets_out = layout.offsets();
+    // We assume there are no implicit dims.
+    int tiling_dim = op.getDimension() - (op.getType().getRank() - 2);
+    if (auto amount = op.getAmount().getDefiningOp<arith::ConstantOp>();
+        amount && (tiling_dim == 0 || tiling_dim == 1)) {
+      if (auto integer_attr = dyn_cast<IntegerAttr>(amount.getValue())) {
+        const int64_t tile_size = layout.tiling()[tiling_dim];
+        const int64_t dim_size = op.getType().getShape()[op.getDimension()];
+        const int64_t shift = integer_attr.getValue().getSExtValue();
+        if (dim_size % tile_size != 0) {
+          offsets_out[tiling_dim] = (dim_size - (shift % dim_size)) % tile_size;
+        }
+      }
+    }
+    auto out_layout = VectorLayout(bitwidth, offsets_out,
+                                   nativeTiling(bitwidth), ImplicitDim::kNone);
+    setLayout(op, {layout, kNoLayout}, out_layout);
     return success();
   }
 
@@ -1501,7 +1525,30 @@ class VectorLayoutInferer {
                              native_tiling, ImplicitDim::kNone));
       return success();
     }
-    op.emitOpError("unsupported shape cast");
+
+    // Shape cast (..., m, n, k * target_shape_[1]) -> (..., m, n * k *
+    // target_shape_[1]) for 32-bit types. We allow multiple major or minor
+    // dimensions to be folded or unfolded.
+    if (kNativeBitwidth == bitwidth && res_shape.size() >= 2 &&
+        src_shape.size() >= 2 && src_shape.back() % native_tiling[1] == 0 &&
+        res_shape.back() % native_tiling[1] == 0 &&
+        (mlir::tpu::canFoldMinorDimsToSize(src_shape, res_shape.back()) ||
+         mlir::tpu::canFoldMinorDimsToSize(res_shape, src_shape.back()))) {
+      // TODO(jsreeram): Add support for picking space-efficient tilings for
+      // small 2nd minor dim shapes.
+      // Example 1: (4, 2, 1024) -> (4, 2048) If we infer src and tgt layout to
+      // be (1, 128), it is no-op because essentially we just shufflle the VREGs
+      // in VREG array.
+      // Example 2: (4, 256) -> (1, 1024) is actually sublane
+      // shuffle inside each vreg from [0, 1, 2, 3, 4,..7] to [0, 4, 1, 5, ...]
+      setLayout(op,
+                VectorLayout(layout.bitwidth(), {0, 0}, native_tiling,
+                             ImplicitDim::kNone),
+                VectorLayout(layout.bitwidth(), {0, 0}, native_tiling,
+                             ImplicitDim::kNone));
+      return success();
+    }
+    op.emitOpError("infer-vector-layout: unsupported shape cast");
     return failure();
   }
 
@@ -1633,17 +1680,27 @@ class VectorLayoutInferer {
     auto src_ty = op.getSourceVectorType();
     TPU_CHECK_OP(permutation.size() == src_ty.getRank(),
                  "Transpose permutation has incorrect rank");
-    for (auto dim : permutation.drop_back(2)) {
-      TPU_CHECK_OP(dim < src_ty.getRank() - 2,
-                   "Unsupported transpose permutation - minor dims into major");
-    }
-    for (auto dim : permutation.take_back(2)) {
-      TPU_CHECK_OP(dim >= src_ty.getRank() - 2,
-                   "Unsupported transpose permutation - major dims into minor");
+    bool untiled_tiled_swap = false;
+    // TODO(mvoz): Expand to more general cases. b/419268277
+    if (permutation.size() == 3 && permutation[0] == 1 && permutation[1] == 0) {
+      untiled_tiled_swap = true;
+    } else {
+      for (auto dim : permutation.drop_back(2)) {
+        TPU_CHECK_OP(dim < src_ty.getRank() - 2,
+                     "Unsupported transpose permutation - minor dims into "
+                     "major > 3 dimensions");
+      }
+      for (auto dim : permutation.take_back(2)) {
+        TPU_CHECK_OP(dim >= src_ty.getRank() - 2,
+                     "Unsupported transpose permutation - major dims into "
+                     "minor > 3 dimensions");
+      }
     }
     Layout required_layout = some_layout;
-    // Require native tiling if we're going to use the XLU.
-    if (permutation[permutation.size() - 1] == permutation.size() - 2) {
+    // Require native tiling if we're going to use the XLU, or doing a
+    // major/minor permute.
+    if (untiled_tiled_swap ||
+        permutation[permutation.size() - 1] == permutation.size() - 2) {
       auto native_tiling = nativeTiling(layout.bitwidth());
       required_layout = VectorLayout(layout.bitwidth(), LayoutOffsets{0, 0},
                                      native_tiling, ImplicitDim::kNone);

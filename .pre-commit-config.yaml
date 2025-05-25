@@ -9,7 +9,7 @@
 
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: 2c9f875913ee60ca25ce70243dc24d5b6415598c  # frozen: v4.6.0
+  rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # frozen: v5.0.0
   hooks:
   - id: check-ast
   - id: check-merge-conflict
@@ -31,12 +31,12 @@ repos:
     files: \.py$
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: 8983acb92ee4b01924893632cf90af926fa608f0  # frozen: v0.7.0
+  rev: 24e02b24b8ab2b7c76225602d13fa60e12d114e6  # frozen: v0.11.9
   hooks:
   - id: ruff
 
 - repo: https://github.com/pre-commit/mirrors-mypy
-  rev: 'bbc3dc1f890007061f18f17e2334f216ea9e5df7'  # frozen: v1.14.1
+  rev: 'f40886d54c729f533f864ed6ce584e920feb0af7'  # frozen: v1.15.0
   hooks:
   - id: mypy
     files: (jax/|tests/typing_test\.py)

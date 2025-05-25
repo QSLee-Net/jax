@@ -354,6 +354,18 @@ def assert_num_jit_and_pmap_compilations(times):
     raise AssertionError(f"Expected exactly {times} XLA compilations, "
                          f"but executed {count()}")
 
+@contextmanager
+def count_internal_device_puts():
+  before = jax._src.lib._jax.get_internal_device_put_info()
+  counts = {}
+  try:
+    yield lambda: counts
+  finally:
+    after = jax._src.lib._jax.get_internal_device_put_info()
+    for k, v in after.items():
+      diff = v - before.get(k, 0)
+      if diff != 0:
+        counts[k] = diff
 
 def jaxlib_version() -> tuple[int, ...]:
   return _jaxlib.version
